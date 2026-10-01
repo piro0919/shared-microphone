@@ -54,6 +54,30 @@ await micBus.open();
 // Both receive the same frames from a single device.
 ```
 
+### Sharing the device without closing it on each other
+
+`close()` closes the device for everyone. When consumers come and go on their own,
+have each take a reference with `acquire()` instead. The device opens on the first
+reference and closes when the last one is released.
+
+```ts
+// In the wake word detector
+const release = await micBus.acquire();
+const unsubscribe = micBus.subscribe(wakeWordDetector.write);
+// ...
+unsubscribe();
+release(); // The transcriber, if it still holds a reference, keeps receiving.
+```
+
+`acquire(deviceId)` switches the one device for every holder, as `open(deviceId)`
+does. If opening fails the promise rejects and no reference is taken.
+`micBus.holderCount` reports how many are held.
+
+`close()` is the override: it closes the device now, drops every reference (their
+release functions become no-ops), and cancels an `open()` or `acquire()` still in
+progress, which then rejects with an `AbortError` and releases whatever device it
+had acquired.
+
 ### Surfacing what went wrong
 
 ```ts
@@ -70,7 +94,8 @@ const bus = createMicBus({
 
 | `type` | Meaning |
 | ---- | ---- |
-| `device-fallback` | The requested device could not be opened, so the default one is in use |
+| `device-fallback` | The requested device could not be opened, so the default one is in use. `deviceId` reads `null`, and opening the requested device again tries it again |
+| `device-ended` | The open device stopped delivering audio, e.g. it was unplugged. The bus has closed; `open()` or `acquire()` reopens |
 | `listener-failed` | A listener threw. Delivery to the others continued |
 | `sink-not-silenced` | The output sink could not be silenced. It still works |
 
@@ -80,7 +105,7 @@ Pass them to `createMicBus(options)`. The exported `micBus` is `createMicBus()`.
 
 | Option | Default | Meaning |
 | ---- | ---- | ---- |
-| `frameSize` | `4096` | Samples per frame. Roughly every 85 ms at 48 kHz |
+| `frameSize` | `4096` | Samples per frame. Roughly every 85 ms at 48 kHz. A power of two from 256 to 16384; anything else throws a `RangeError` from `createMicBus` |
 | `getUserMedia` | `navigator.mediaDevices.getUserMedia` | Replaces the acquisition call |
 | `audioContext` | global | Creates the `AudioContext`, falling back to `webkitAudioContext` |
 | `onWarning` | — | Receives the events in the table above |
@@ -105,6 +130,8 @@ Each of these was found on real hardware and is built into the implementation.
 - **A failure during wiring releases the microphone it acquired.** Otherwise an open
   device nobody receives from is stranded, and the next open cannot acquire one
 - **Concurrent opens collapse into one.** Letting them through opens a second device
+- **An unplugged device closes the bus.** Its track ends and no frame arrives
+  again, so the bus closes and reports `device-ended` rather than looking open
 
 ## Known limitations
 

@@ -32,11 +32,25 @@ const RETRIABLE_ERRORS = new Set([
 
 /** ScriptProcessor granularity. At 48 kHz one frame arrives roughly every 85 ms. */
 const DEFAULT_FRAME_SIZE = 4096;
+/** The buffer sizes `createScriptProcessor` accepts. */
+const MIN_FRAME_SIZE = 256;
+const MAX_FRAME_SIZE = 16384;
 const RETRY_DELAY_MS = 250;
 
 export type MicBusWarning =
-  /** The requested device could not be opened, so the default one is in use. */
+  /**
+   * The requested device could not be opened, so the default one is in use.
+   * `deviceId` is the one that was requested; the bus reports `null` while on the
+   * default, and opening the requested device again tries it again.
+   */
   | { deviceId: string; error: unknown; type: "device-fallback" }
+  /**
+   * The open device stopped delivering audio — it was unplugged, or the browser
+   * or OS revoked it. The bus has closed. `deviceId` is the device that ended,
+   * `null` for the default one. Listeners stay attached; holders from `acquire()`
+   * stay counted, and the next `open()` or `acquire()` reopens.
+   */
+  | { deviceId: null | string; type: "device-ended" }
   /** A listener threw. Delivery to the others continued. */
   | { error: unknown; type: "listener-failed" }
   /** The output sink could not be silenced. Playback still works on most devices. */
@@ -45,7 +59,11 @@ export type MicBusWarning =
 export type MicBusOptions = {
   /** Creates the `AudioContext`. Defaults to the global one, falling back to `webkitAudioContext`. */
   audioContext?: () => AudioContext;
-  /** Samples per frame. A power of two. Defaults to 4096. */
+  /**
+   * Samples per frame. A power of two from 256 to 16384, as `createScriptProcessor`
+   * requires. Defaults to 4096. Anything else throws a `RangeError` from
+   * `createMicBus`.
+   */
   frameSize?: number;
   /** Replaces `navigator.mediaDevices.getUserMedia`. */
   getUserMedia?: (constraints: MediaStreamConstraints) => Promise<MediaStream>;
@@ -53,18 +71,44 @@ export type MicBusOptions = {
   onWarning?: (warning: MicBusWarning) => void;
 };
 
+/** Gives back a reference taken with `acquire()`. Calling it again does nothing. */
+export type MicRelease = () => void;
+
 export type MicBus = {
-  /** The open device, or null for the default one. Also null while closed. */
+  /**
+   * The open device, or null for the default one. Also null while closed, and
+   * null after a requested device failed and the default one was opened instead.
+   */
   readonly deviceId: null | string;
+  /** How many references taken with `acquire()` are still held. */
+  readonly holderCount: number;
   /** Whether the microphone is currently open. */
   readonly isOpen: boolean;
   /** How many listeners are attached. */
   readonly listenerCount: number;
-  /** Close the microphone. Listeners stay attached and resume on the next open. */
+  /**
+   * Take a reference to the microphone and open it if needed. The microphone
+   * stays open until every reference is released, so one consumer finishing does
+   * not cut off another. Call the returned function to release.
+   *
+   * There is still one device: acquiring with a different `deviceId` switches it
+   * for every holder, as `open()` does. If opening fails, no reference is taken
+   * and the promise rejects.
+   */
+  acquire: (deviceId?: null | string) => Promise<MicRelease>;
+  /**
+   * Close the microphone now, whoever holds it. Every reference from `acquire()`
+   * is dropped (their release functions become no-ops) and an `open()` still in
+   * flight is cancelled: it rejects with an `AbortError` and the device it was
+   * acquiring is released. Listeners stay attached and resume on the next open.
+   *
+   * Consumers that share the bus should use `acquire()` and release instead.
+   */
   close: () => void;
   /**
    * Open the microphone. Does nothing if the same device is already open.
-   * Reopens when the requested device changed.
+   * Reopens when the requested device changed. Takes no reference: the device
+   * stays open until `close()`, or until the last `acquire()` holder releases.
    */
   open: (deviceId?: null | string) => Promise<void>;
   /** Start receiving audio frames. Call the returned function to stop. */
@@ -73,6 +117,7 @@ export type MicBus = {
 
 type State = {
   audioContext: AudioContext | null;
+  /** What `open()` compares against: null when the default device is in use. */
   deviceId: null | string;
   processor: null | ScriptProcessorNode;
   silentGain: GainNode | null;
@@ -96,6 +141,12 @@ function defaultAudioContext(): AudioContext {
   return new impl();
 }
 
+function abortError(): Error {
+  const error = new Error("The microphone was closed while it was opening");
+  error.name = "AbortError";
+  return error;
+}
+
 function defaultGetUserMedia(
   constraints: MediaStreamConstraints,
 ): Promise<MediaStream> {
@@ -115,6 +166,18 @@ function defaultGetUserMedia(
  */
 export function createMicBus(options: MicBusOptions = {}): MicBus {
   const frameSize = options.frameSize ?? DEFAULT_FRAME_SIZE;
+  // createScriptProcessor would reject a bad size only on the first open, far from
+  // the code that chose it.
+  if (
+    !Number.isInteger(frameSize) ||
+    frameSize < MIN_FRAME_SIZE ||
+    frameSize > MAX_FRAME_SIZE ||
+    (frameSize & (frameSize - 1)) !== 0
+  ) {
+    throw new RangeError(
+      `frameSize must be a power of two from ${MIN_FRAME_SIZE} to ${MAX_FRAME_SIZE}, got ${frameSize}`,
+    );
+  }
   const getUserMedia = options.getUserMedia ?? defaultGetUserMedia;
   const makeAudioContext = options.audioContext ?? defaultAudioContext;
   const listeners = new Set<MicFrameListener>();
@@ -128,6 +191,11 @@ export function createMicBus(options: MicBusOptions = {}): MicBus {
   };
   // Collapse concurrent opens into one. Letting them through opens a second device.
   let openInFlight: null | Promise<void> = null;
+  let openInFlightFor: null | string = null;
+  // Bumped by close(). An open that started under an older value was cancelled.
+  let generation = 0;
+  const holders = new Set<symbol>();
+  let detachEnded: (() => void) | null = null;
 
   function warn(warning: MicBusWarning): void {
     options.onWarning?.(warning);
@@ -149,18 +217,29 @@ export function createMicBus(options: MicBusOptions = {}): MicBus {
     }
   }
 
-  async function getStream(deviceId: null | string): Promise<MediaStream> {
-    if (!deviceId) return acquire({ audio: true });
+  /** The stream, and the device it is actually on: null for the default one. */
+  async function getStream(
+    deviceId: null | string,
+  ): Promise<{ deviceId: null | string; stream: MediaStream }> {
+    if (!deviceId)
+      return { deviceId: null, stream: await acquire({ audio: true }) };
     try {
-      return await acquire({ audio: { deviceId: { exact: deviceId } } });
+      const stream = await acquire({
+        audio: { deviceId: { exact: deviceId } },
+      });
+      return { deviceId, stream };
     } catch (error) {
-      // The chosen microphone may have been unplugged. Fall back and keep going.
+      // The chosen microphone may have been unplugged. Fall back and keep going,
+      // and record the default as what is open, so a later open(deviceId) tries
+      // the requested device again instead of treating it as already open.
       warn({ deviceId, error, type: "device-fallback" });
-      return acquire({ audio: true });
+      return { deviceId: null, stream: await acquire({ audio: true }) };
     }
   }
 
   function teardown(): void {
+    detachEnded?.();
+    detachEnded = null;
     if (state.processor) {
       state.processor.onaudioprocess = null;
       state.processor.disconnect();
@@ -190,9 +269,25 @@ export function createMicBus(options: MicBusOptions = {}): MicBus {
   async function attach(
     stream: MediaStream,
     deviceId: null | string,
+    isCancelled: () => boolean,
   ): Promise<void> {
     const audioContext = makeAudioContext();
+    try {
+      await wire(audioContext, stream, deviceId, isCancelled);
+    } catch (error) {
+      if (audioContext.state !== "closed") {
+        void audioContext.close().catch(() => {});
+      }
+      throw error;
+    }
+  }
 
+  async function wire(
+    audioContext: AudioContext,
+    stream: MediaStream,
+    deviceId: null | string,
+    isCancelled: () => boolean,
+  ): Promise<void> {
     // Recording needs no speaker output. While Bluetooth is connected the
     // AudioContext routes its output to the headset, and some Android devices
     // cannot establish full-duplex SCO alongside the microphone input. When that
@@ -216,6 +311,7 @@ export function createMicBus(options: MicBusOptions = {}): MicBus {
     if (audioContext.state === "suspended") {
       await audioContext.resume();
     }
+    if (isCancelled()) throw abortError();
 
     const source = audioContext.createMediaStreamSource(stream);
     const processor = audioContext.createScriptProcessor(frameSize, 1, 1);
@@ -239,6 +335,20 @@ export function createMicBus(options: MicBusOptions = {}): MicBus {
     processor.connect(silentGain);
     silentGain.connect(audioContext.destination);
 
+    // An unplugged device ends its track and no frame ever arrives again. Close
+    // and say so, rather than look open while delivering nothing.
+    const onEnded = (): void => {
+      if (state.stream !== stream) return;
+      const ended = state.deviceId;
+      teardown();
+      warn({ deviceId: ended, type: "device-ended" });
+    };
+    const tracks = stream.getTracks();
+    for (const track of tracks) track.addEventListener("ended", onEnded);
+    detachEnded = (): void => {
+      for (const track of tracks) track.removeEventListener("ended", onEnded);
+    };
+
     state.audioContext = audioContext;
     state.deviceId = deviceId;
     state.processor = processor;
@@ -247,10 +357,14 @@ export function createMicBus(options: MicBusOptions = {}): MicBus {
     state.stream = stream;
   }
 
-  async function openOnce(deviceId: null | string): Promise<void> {
-    const stream = await getStream(deviceId);
+  async function openOnce(
+    requested: null | string,
+    isCancelled: () => boolean,
+  ): Promise<void> {
+    const { deviceId, stream } = await getStream(requested);
     try {
-      await attach(stream, deviceId);
+      if (isCancelled()) throw abortError();
+      await attach(stream, deviceId, isCancelled);
     } catch (error) {
       // Failing here leaves the acquired microphone out of reach of teardown(),
       // because it is not in state yet. That would strand an open device nobody
@@ -261,12 +375,63 @@ export function createMicBus(options: MicBusOptions = {}): MicBus {
     }
   }
 
+  async function open(deviceId: null | string = null): Promise<void> {
+    if (openInFlight) {
+      const sameRequest = openInFlightFor === deviceId;
+      await openInFlight;
+      // Also return when that open fell back to the default device: asking for the
+      // same missing device again straight away would only fail the same way.
+      if (state.stream && (sameRequest || state.deviceId === deviceId)) return;
+    }
+    if (state.stream && state.deviceId === deviceId) return;
+
+    const started = generation;
+    const isCancelled = (): boolean => generation !== started;
+    const opening = (async (): Promise<void> => {
+      if (state.stream) teardown();
+      try {
+        await openOnce(deviceId, isCancelled);
+      } catch (error) {
+        // A cancelled open must not tear down what a later open set up.
+        if (!isCancelled()) teardown();
+        throw error;
+      }
+    })().finally(() => {
+      if (openInFlight === opening) openInFlight = null;
+    });
+    openInFlight = opening;
+    openInFlightFor = deviceId;
+
+    await opening;
+  }
+
   return {
+    async acquire(deviceId: null | string = null): Promise<MicRelease> {
+      const token = Symbol("mic-holder");
+      holders.add(token);
+      try {
+        await open(deviceId);
+      } catch (error) {
+        if (holders.delete(token) && holders.size === 0) teardown();
+        throw error;
+      }
+      return (): void => {
+        // Already released, or dropped by close().
+        if (!holders.delete(token)) return;
+        if (holders.size === 0) teardown();
+      };
+    },
     close(): void {
+      generation += 1;
+      openInFlight = null;
+      holders.clear();
       teardown();
     },
     get deviceId(): null | string {
       return state.deviceId;
+    },
+    get holderCount(): number {
+      return holders.size;
     },
     get isOpen(): boolean {
       return state.stream !== null;
@@ -274,27 +439,7 @@ export function createMicBus(options: MicBusOptions = {}): MicBus {
     get listenerCount(): number {
       return listeners.size;
     },
-    async open(deviceId: null | string = null): Promise<void> {
-      if (openInFlight) {
-        await openInFlight;
-        if (state.stream && state.deviceId === deviceId) return;
-      }
-      if (state.stream && state.deviceId === deviceId) return;
-
-      openInFlight = (async (): Promise<void> => {
-        if (state.stream) teardown();
-        try {
-          await openOnce(deviceId);
-        } catch (error) {
-          teardown();
-          throw error;
-        }
-      })().finally(() => {
-        openInFlight = null;
-      });
-
-      await openInFlight;
-    },
+    open,
     subscribe(listener: MicFrameListener): () => void {
       listeners.add(listener);
       return (): void => {

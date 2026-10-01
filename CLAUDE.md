@@ -63,6 +63,13 @@ Each came from real hardware. Do not "simplify" them away without a device to te
 - **A failure during wiring releases the microphone it acquired.** Otherwise an open
   device nobody receives from is stranded.
 - **Concurrent opens collapse into one.** Letting them through opens a second device.
+- **A fallback records the default device**, not the requested one. Otherwise a
+  later `open(sameId)` sees the requested id and never tries it again.
+- **`close()` is the override; `acquire()`/release is the shared path.** `close()`
+  drops every reference and cancels an open in flight (a generation counter checked
+  after each await). Without that cancel, the open finishes after the close and
+  leaves the device on.
+- **A track's `ended` closes the bus** and emits `device-ended`.
 
 ## Releasing
 

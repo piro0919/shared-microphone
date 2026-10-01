@@ -6,6 +6,7 @@ export {
   type MicBusOptions,
   type MicBusWarning,
   type MicFrameListener,
+  type MicRelease,
 } from "./mic-bus";
 
 /**

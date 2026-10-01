@@ -1,15 +1,31 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createMicBus, type MicBusWarning } from "../src/mic-bus";
 
-/** An audio track that only records whether it was stopped. */
-function makeTrack(): MediaStreamTrack & { stopped: boolean } {
+type FakeTrack = MediaStreamTrack & {
+  /** Pretend the device was unplugged. */
+  end: () => void;
+  stopped: boolean;
+};
+
+/** An audio track that records whether it was stopped and can be ended. */
+function makeTrack(): FakeTrack {
+  const onEnded = new Set<() => void>();
   const track = {
+    addEventListener: (type: string, listener: () => void): void => {
+      if (type === "ended") onEnded.add(listener);
+    },
+    end: (): void => {
+      for (const listener of [...onEnded]) listener();
+    },
+    removeEventListener: (type: string, listener: () => void): void => {
+      if (type === "ended") onEnded.delete(listener);
+    },
     stop: (): void => {
       track.stopped = true;
     },
     stopped: false,
   };
-  return track as unknown as MediaStreamTrack & { stopped: boolean };
+  return track as unknown as FakeTrack;
 }
 
 function makeStream(): MediaStream & {
@@ -351,5 +367,222 @@ describe("output sink", () => {
     expect(harness.warnings).toContainEqual(
       expect.objectContaining({ type: "sink-not-silenced" }),
     );
+  });
+});
+
+describe("device fallback", () => {
+  it("records the default device, so asking for the named one again retries it", async () => {
+    const getUserMedia = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error("gone"), { name: "OverconstrainedError" }),
+      )
+      .mockImplementation(() => Promise.resolve(makeStream()));
+    const harness = setup({ getUserMedia });
+
+    await harness.bus.open("mic-1");
+    // The default device is what is open, not mic-1.
+    expect(harness.bus.deviceId).toBeNull();
+
+    // mic-1 is back. Asking again must try it, not treat it as already open.
+    await harness.bus.open("mic-1");
+    expect(getUserMedia).toHaveBeenLastCalledWith({
+      audio: { deviceId: { exact: "mic-1" } },
+    });
+    expect(harness.bus.deviceId).toBe("mic-1");
+  });
+
+  it("does not reopen the default device after falling back to it", async () => {
+    const getUserMedia = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error("gone"), { name: "OverconstrainedError" }),
+      )
+      .mockImplementation(() => Promise.resolve(makeStream()));
+    const harness = setup({ getUserMedia });
+
+    await harness.bus.open("mic-1");
+    await harness.bus.open();
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("concurrent opens after a fallback", () => {
+  it("collapses them even though the default device ended up open", async () => {
+    const getUserMedia = vi
+      .fn()
+      .mockRejectedValueOnce(
+        Object.assign(new Error("gone"), { name: "OverconstrainedError" }),
+      )
+      .mockImplementation(() => Promise.resolve(makeStream()));
+    const harness = setup({ getUserMedia });
+
+    await Promise.all([
+      harness.bus.acquire("mic-1"),
+      harness.bus.acquire("mic-1"),
+    ]);
+    // One failed exact request and one fallback; no second round.
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+    expect(harness.bus.holderCount).toBe(2);
+  });
+});
+
+describe("close during an open", () => {
+  function deferredStream() {
+    let resolve: (stream: MediaStream) => void = () => {};
+    const promise = new Promise<MediaStream>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  }
+
+  it("cancels the open and releases the device it was acquiring", async () => {
+    const pending = deferredStream();
+    const harness = setup({ getUserMedia: () => pending.promise });
+
+    const opening = harness.bus.open();
+    harness.bus.close();
+    const stream = makeStream();
+    pending.resolve(stream);
+
+    await expect(opening).rejects.toMatchObject({ name: "AbortError" });
+    expect(stream.tracks[0]?.stopped).toBe(true);
+    expect(harness.bus.isOpen).toBe(false);
+    expect(harness.contexts).toHaveLength(0);
+  });
+
+  it("cancels an open that is still wiring the AudioContext", async () => {
+    let sinkSet: () => void = () => {};
+    const setSinkId = vi.fn(
+      () =>
+        new Promise<void>((done) => {
+          sinkSet = done;
+        }),
+    );
+    const stream = makeStream();
+    const harness = setup({
+      contextOverrides: { setSinkId } as never,
+      getUserMedia: () => Promise.resolve(stream),
+    });
+    const opening = harness.bus.open();
+    // getUserMedia has settled and wiring is waiting on setSinkId.
+    await vi.waitFor(() => expect(setSinkId).toHaveBeenCalled());
+    harness.bus.close();
+    sinkSet();
+
+    await expect(opening).rejects.toMatchObject({ name: "AbortError" });
+    expect(stream.tracks[0]?.stopped).toBe(true);
+    expect(harness.contexts[0]?.closed).toBe(true);
+    expect(harness.bus.isOpen).toBe(false);
+  });
+
+  it("lets a later open go ahead", async () => {
+    const pending = deferredStream();
+    const getUserMedia = vi
+      .fn()
+      .mockReturnValueOnce(pending.promise)
+      .mockImplementation(() => Promise.resolve(makeStream()));
+    const harness = setup({ getUserMedia });
+
+    const first = harness.bus.open();
+    harness.bus.close();
+    const second = harness.bus.open();
+    pending.resolve(makeStream());
+
+    await expect(first).rejects.toMatchObject({ name: "AbortError" });
+    await second;
+    expect(harness.bus.isOpen).toBe(true);
+  });
+});
+
+describe("acquire", () => {
+  it("keeps the microphone open until the last holder releases", async () => {
+    const harness = setup();
+    const releaseA = await harness.bus.acquire();
+    const releaseB = await harness.bus.acquire();
+    // One device for both.
+    expect(harness.calls).toHaveLength(1);
+    expect(harness.bus.holderCount).toBe(2);
+
+    releaseA();
+    expect(harness.bus.isOpen).toBe(true);
+
+    releaseB();
+    expect(harness.bus.isOpen).toBe(false);
+    expect(harness.streams[0]?.tracks[0]?.stopped).toBe(true);
+  });
+
+  it("ignores a second release from the same holder", async () => {
+    const harness = setup();
+    const releaseA = await harness.bus.acquire();
+    await harness.bus.acquire();
+
+    releaseA();
+    releaseA();
+    expect(harness.bus.holderCount).toBe(1);
+    expect(harness.bus.isOpen).toBe(true);
+  });
+
+  it("drops every reference on close", async () => {
+    const harness = setup();
+    const release = await harness.bus.acquire();
+    harness.bus.close();
+    expect(harness.bus.holderCount).toBe(0);
+
+    // A release after close must not close a device someone opened since.
+    await harness.bus.open();
+    release();
+    expect(harness.bus.isOpen).toBe(true);
+  });
+
+  it("takes no reference when opening fails", async () => {
+    const error = Object.assign(new Error("denied"), {
+      name: "NotAllowedError",
+    });
+    const harness = setup({ getUserMedia: () => Promise.reject(error) });
+
+    await expect(harness.bus.acquire()).rejects.toThrow("denied");
+    expect(harness.bus.holderCount).toBe(0);
+  });
+});
+
+describe("device ended", () => {
+  it("closes and warns when the track ends", async () => {
+    const harness = setup();
+    await harness.bus.open("mic-1");
+    harness.streams[0]?.tracks[0]?.end();
+
+    expect(harness.bus.isOpen).toBe(false);
+    expect(harness.contexts[0]?.closed).toBe(true);
+    expect(harness.warnings).toContainEqual({
+      deviceId: "mic-1",
+      type: "device-ended",
+    });
+
+    await harness.bus.open("mic-1");
+    expect(harness.bus.isOpen).toBe(true);
+  });
+
+  it("ignores an ended track from a stream it already closed", async () => {
+    const harness = setup();
+    await harness.bus.open("mic-1");
+    await harness.bus.open("mic-2");
+    harness.streams[0]?.tracks[0]?.end();
+
+    expect(harness.bus.isOpen).toBe(true);
+    expect(harness.warnings).toEqual([]);
+  });
+});
+
+describe("frameSize", () => {
+  it.each([0, 128, 1000, 32768, 4096.5, Number.NaN])(
+    "rejects %s",
+    (frameSize) => {
+      expect(() => createMicBus({ frameSize })).toThrow(RangeError);
+    },
+  );
+
+  it.each([256, 4096, 16384])("accepts %s", (frameSize) => {
+    expect(() => createMicBus({ frameSize })).not.toThrow();
   });
 });
