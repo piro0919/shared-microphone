@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `acquire(deviceId?)` returns a release function and reference-counts the device:
+  it opens on the first reference and closes when the last one is released, so one
+  consumer finishing no longer closes the microphone for the others.
+  `holderCount` reports how many are held. `close()` stays the forced close for
+  everyone and now also drops every reference.
+- `device-ended` warning. When the open device's track ends (unplugged, revoked)
+  the bus closes and reports it, instead of looking open while no frame arrives.
+- `engines.node` is back, as `>=18`. CI checks the packed package with
+  `publint --strict` and `attw` (`pnpm check:package`), runs the tests on Node 22
+  and 24, and checks the build loads on Node 18 and 20.
+
+### Fixed
+
+- **BREAKING:** after a requested device fails and the default one is opened
+  instead, `deviceId` reads `null` (the device actually open) rather than the
+  requested id. Before, a later `open(sameId)` saw the requested id, did nothing,
+  and stayed on the default device for good.
+- **BREAKING:** `close()` during an `open()` cancels it. The open rejects with an
+  `AbortError` and releases the microphone it acquired. Before, the open finished
+  after the close and left the microphone on. Code that calls `close()` while an
+  `open()` is pending must now handle the rejection.
+- **BREAKING:** an invalid `frameSize` throws a `RangeError` from `createMicBus`.
+  It must be a power of two from 256 to 16384. Before, it failed on the first open.
+- **BREAKING (types):** `MicBusWarning` has a new member, `device-ended`. An
+  exhaustive `switch` over `warning.type` needs a case for it.
+
 ## 0.1.3
 
 ### Changed
