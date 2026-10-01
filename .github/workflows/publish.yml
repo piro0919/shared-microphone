@@ -35,6 +35,7 @@ jobs:
       - run: pnpm test
       - run: pnpm lint
       - run: pnpm build:lib
+      - run: pnpm check:package
       - run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

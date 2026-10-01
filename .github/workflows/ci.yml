@@ -22,3 +22,52 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build:lib
+      - run: pnpm check:package
+
+  # The tests on every Node line the dev toolchain runs on. pnpm 11 needs
+  # Node >= 22.13, so older lines only get the load check below.
+  node:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+
+  # `engines` allows Node 18 and 20 — the package is imported during SSR even
+  # though it only runs in the browser. Build on 22 and check the build loads on
+  # them through both entry points.
+  old-node-load:
+    name: load on node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:lib
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node -e "const m = require('shared-microphone'); if (typeof m.createMicBus !== 'function' || !m.micBus) process.exit(1)"
+      - run: node --input-type=module -e "const m = await import('shared-microphone'); if (typeof m.createMicBus !== 'function' || !m.micBus) process.exit(1)"
