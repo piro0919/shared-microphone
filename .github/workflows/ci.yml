@@ -45,7 +45,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
 
-  # `engines` allows Node 18 and 20 — the package is imported during SSR even
+  # The package supports Node 18 and 20 — the package is imported during SSR even
   # though it only runs in the browser. Build on 22 and check the build loads on
   # them through both entry points.
   old-node-load:
