@@ -336,6 +336,14 @@ export default function Home() {
         </a>
         <a
           className="text-zinc-500 transition-colors hover:text-zinc-300"
+          href="https://buymeacoffee.com/piro0919"
+          rel="noreferrer"
+          target="_blank"
+        >
+          Buy Me a Coffee →
+        </a>
+        <a
+          className="text-zinc-500 transition-colors hover:text-zinc-300"
           href="https://www.npmjs.com/package/shared-microphone"
           rel="noreferrer"
           target="_blank"
