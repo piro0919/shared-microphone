@@ -92,23 +92,23 @@ const bus = createMicBus({
 });
 ```
 
-| `type` | Meaning |
-| ---- | ---- |
-| `device-fallback` | The requested device could not be opened, so the default one is in use. `deviceId` reads `null`, and opening the requested device again tries it again |
-| `device-ended` | The open device stopped delivering audio, e.g. it was unplugged. The bus has closed; `open()` or `acquire()` reopens |
-| `listener-failed` | A listener threw. Delivery to the others continued |
-| `sink-not-silenced` | The output sink could not be silenced. It still works |
+| `type`              | Meaning                                                                                                                                                |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `device-fallback`   | The requested device could not be opened, so the default one is in use. `deviceId` reads `null`, and opening the requested device again tries it again |
+| `device-ended`      | The open device stopped delivering audio, e.g. it was unplugged. The bus has closed; `open()` or `acquire()` reopens                                   |
+| `listener-failed`   | A listener threw. Delivery to the others continued                                                                                                     |
+| `sink-not-silenced` | The output sink could not be silenced. It still works                                                                                                  |
 
 ## Options
 
 Pass them to `createMicBus(options)`. The exported `micBus` is `createMicBus()`.
 
-| Option | Default | Meaning |
-| ---- | ---- | ---- |
-| `frameSize` | `4096` | Samples per frame. Roughly every 85 ms at 48 kHz. A power of two from 256 to 16384; anything else throws a `RangeError` from `createMicBus` |
-| `getUserMedia` | `navigator.mediaDevices.getUserMedia` | Replaces the acquisition call |
-| `audioContext` | global | Creates the `AudioContext`, falling back to `webkitAudioContext` |
-| `onWarning` | — | Receives the events in the table above |
+| Option         | Default                               | Meaning                                                                                                                                     |
+| -------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `frameSize`    | `4096`                                | Samples per frame. Roughly every 85 ms at 48 kHz. A power of two from 256 to 16384; anything else throws a `RangeError` from `createMicBus` |
+| `getUserMedia` | `navigator.mediaDevices.getUserMedia` | Replaces the acquisition call                                                                                                               |
+| `audioContext` | global                                | Creates the `AudioContext`, falling back to `webkitAudioContext`                                                                            |
+| `onWarning`    | —                                     | Receives the events in the table above                                                                                                      |
 
 ## Device quirks handled here
 
