@@ -75,7 +75,12 @@ Each came from real hardware. Do not "simplify" them away without a device to te
 
 Bump `version` in `package.json`, add a `CHANGELOG.md` entry, then push a `vX.Y.Z`
 tag. `.github/workflows/publish.yml` publishes to npm with provenance and fails if
-the tag and the version disagree.
+the tag and the version disagree. It authenticates through npm trusted publishing
+(OIDC), so there is no `NPM_TOKEN` to renew. The trusted publisher on npmjs.com
+(package Settings → Trusted Publisher → GitHub Actions) is `piro0919/shared-microphone`
+with workflow `publish.yml` and "Allow npm publish" checked. **It is not validated yet:**
+npm drops a connection that sees no publish within 48 hours, so before the next release
+check that it still exists, recreate it if it is gone, then push the tag.
 
 ## Notes
 

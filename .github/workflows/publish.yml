@@ -36,6 +36,5 @@ jobs:
       - run: pnpm lint
       - run: pnpm build:lib
       - run: pnpm check:package
+      # npm の Trusted Publishing（OIDC）で公開する。トークンは使わない
       - run: npm publish --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
